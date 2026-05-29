@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.venv311/
+venv/
+dist/
+build/
+*.egg-info/
+*.log
+
+# Local outputs
+artifacts/
+tmp/
+outputs/
+
+# Generated analysis media
+pose_analysis_pro.mp4
+pose_overlay-wr.mp4
+compare_overlay.mp4
+release_moment.jpg
+release_frame-*.jpg
