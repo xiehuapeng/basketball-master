@@ -33,12 +33,24 @@ def detect_ball_around_release(
     seg_ids: list[int],
     release_video_frame: int,
     config: AnalyzerConfig,
+    window_before: int | None = None,
+    window_after: int | None = None,
 ) -> BallDetectionRun | None:
     detector = build_ball_detector(config.ball_detection)
     if detector is None:
         return None
 
-    sampled_frames = _sample_frames_around_release(seg_ids, release_video_frame, config)
+    original_before = config.ball_detection.release_window_before
+    original_after = config.ball_detection.release_window_after
+    if window_before is not None:
+        config.ball_detection.release_window_before = window_before
+    if window_after is not None:
+        config.ball_detection.release_window_after = window_after
+    try:
+        sampled_frames = _sample_frames_around_release(seg_ids, release_video_frame, config)
+    finally:
+        config.ball_detection.release_window_before = original_before
+        config.ball_detection.release_window_after = original_after
     if not sampled_frames:
         return BallDetectionRun(
             provider=config.ball_detection.provider,
@@ -46,6 +58,7 @@ def detect_ball_around_release(
             target_labels=list(config.ball_detection.target_labels),
             sampled_frames=[],
             matched_frames=[],
+            release_frame=release_video_frame,
         )
 
     cv2 = require_cv2()
@@ -62,11 +75,8 @@ def detect_ball_around_release(
         ret, frame = cap.read()
         if not ret:
             continue
-        ok, encoded = cv2.imencode(".jpg", frame)
-        if not ok:
-            continue
 
-        detections = detector.detect(encoded.tobytes())
+        detections = detector.detect(frame)
         if detections:
             matched_frames.append(FrameBallDetections(frame_index=frame_index, detections=detections))
             frame_best = max(detections, key=lambda item: item.confidence)
@@ -75,13 +85,29 @@ def detect_ball_around_release(
                 best_frame = frame_index
 
     cap.release()
+    matched_frame_count = len(matched_frames)
+    detection_rate = float(matched_frame_count / len(sampled_frames)) if sampled_frames else 0.0
+    release_frame_detected = any(frame.frame_index == release_video_frame for frame in matched_frames)
+    nearest_detection_frame = None
+    nearest_detection_delta = None
+    if matched_frames:
+        nearest_detection_frame = min(
+            (frame.frame_index for frame in matched_frames),
+            key=lambda frame_index: abs(frame_index - release_video_frame),
+        )
+        nearest_detection_delta = abs(nearest_detection_frame - release_video_frame)
     return BallDetectionRun(
         provider=config.ball_detection.provider,
         frame_count=len(sampled_frames),
         target_labels=list(config.ball_detection.target_labels),
         sampled_frames=sampled_frames,
         matched_frames=matched_frames,
+        release_frame=release_video_frame,
+        matched_frame_count=matched_frame_count,
+        detection_rate=detection_rate,
+        release_frame_detected=release_frame_detected,
+        nearest_detection_frame=nearest_detection_frame,
+        nearest_detection_delta=nearest_detection_delta,
         best_frame=best_frame,
         best_confidence=best_confidence,
     )
-

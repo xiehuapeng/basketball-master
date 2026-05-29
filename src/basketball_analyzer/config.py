@@ -53,7 +53,7 @@ class BallDetectionConfig:
     release_window_after: int = 6
     sample_stride: int = 1
     confidence_threshold: float = 0.2
-    roboflow_model_id: str = ""
+    roboflow_model_id: str = "basketball-game-detections/9"
     roboflow_api_key: str = ""
     huggingface_model_id: str = ""
     huggingface_api_key: str = ""

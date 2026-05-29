@@ -70,11 +70,75 @@ class BallDetectionRun:
     target_labels: list[str]
     sampled_frames: list[int]
     matched_frames: list[FrameBallDetections]
+    release_frame: int | None = None
+    matched_frame_count: int = 0
+    detection_rate: float = 0.0
+    release_frame_detected: bool = False
+    nearest_detection_frame: int | None = None
+    nearest_detection_delta: int | None = None
     best_frame: int | None = None
     best_confidence: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(slots=True)
+class ReleaseAnalysis:
+    pose_release_frame: int
+    final_release_frame: int
+    source: str
+    delta_from_pose: int
+    rationale: str
+    hand_separation_detected: bool = False
+    contact_frame: int | None = None
+    separation_frame: int | None = None
+    separation_trend: str | None = None
+    ball_candidate_frame: int | None = None
+    ball_candidate_wrist_distance: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class BallDetectionEvaluationRow:
+    provider: str
+    model_id: str
+    input_video: Path
+    release_frame: int
+    sampled_frame_count: int
+    matched_frame_count: int
+    detection_rate: float
+    release_frame_detected: bool
+    nearest_detection_frame: int | None
+    nearest_detection_delta: int | None
+    best_frame: int | None
+    best_confidence: float | None
+    output_json: Path
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["input_video"] = str(self.input_video)
+        payload["output_json"] = str(self.output_json)
+        return payload
+
+
+@dataclass(slots=True)
+class BallDetectionEvaluationReport:
+    provider: str
+    model_ids: list[str]
+    videos: list[Path]
+    rows: list[BallDetectionEvaluationRow]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "model_ids": self.model_ids,
+            "videos": [str(video) for video in self.videos],
+            "rows": [row.to_dict() for row in self.rows],
+        }
 
 
 @dataclass(slots=True)
@@ -98,6 +162,7 @@ class SingleAnalysisResult:
     arm: str
     metadata: VideoMetadata
     clip_info: ClipInfo
+    release_analysis: ReleaseAnalysis
     metrics: ShotMetrics
     tips: list[str]
     artifacts: SingleAnalysisArtifacts

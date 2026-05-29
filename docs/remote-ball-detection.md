@@ -3,43 +3,66 @@
 ## 当前状态
 
 已经完成：
-
 - 远端篮球检测提供方抽象
 - `Roboflow` 与 `Hugging Face` 提供方接入
 - 在离手前后少量抽帧的调用逻辑
-- 单视频分析里额外输出 `ball_detection_result.json`
+- 单视频分析额外输出 `ball_detection_result.json`
+- 多视频、多模型的批量评估 CLI 入口
+- 单视频分析新增 `release_analysis`
+- 输出视频已支持篮球检测框叠加
+- 已支持基于“最后贴手帧 -> 下一帧离手”的最终离手帧修正
 
 还没完成：
+- 扩充更多真实视频样本，继续比较不同模型的检出率
+- 将当前启发式球手分离规则升级为更稳健的时序策略
 
-- 用真实 Hosted API key 做正式联调
-- 比较不同篮球模型在真实视频上的检出率
-- 把篮球检测结果正式并入离手判定主逻辑
+## 当前最优候选
 
-## 适合先试的 3 个方案
+基于目前已经跑过的真实视频：
 
-### 1. Roboflow Universe 社区篮球模型
+- 第一候选：`basketball-game-detections/9`
+- 第二候选：`basketball-detection-dn6fg/1`
 
-最适合 MVP 快速试跑，优先推荐。
+目前结论：
+- `basketball-game-detections/9` 在 `shooting.mp4` 和 `curry.mp4` 上能稳定检测到离手附近篮球
+- 在 `shoot1.mp4` 上，当前几种现成 Hosted 模型都没有稳定检出
+- 现成 Hosted 模型足够支撑 MVP，但还需要更多样本验证泛化能力
 
-- 适合用途：直接验证篮球是否能在离手附近稳定检出
-- 推荐尝试：
-  - `ball / basketball / player / hoop` 这类现成模型
-  - 先挑 2 到 3 个模型做 A/B 测试
-- 接入方式：Hosted API
+## 这次新增的关键能力
 
-## 2. 自己在 Roboflow 上微调篮球检测模型
+之前的逻辑是：
+- 姿态先给出离手帧
+- 如果该帧附近能看到球，就把它当最终离手帧
 
-当现成社区模型不稳时，这是最自然的下一步。
+现在的逻辑是：
+1. 先拿姿态给出一个初始离手帧
+2. 如果这个姿态帧可疑，向前回溯更多原视频帧
+3. 找到“球最后还贴着手”的帧
+4. 把它的下一帧作为最终离手帧
 
-- 适合用途：针对手机拍摄、室内球馆、远距离小球做适配
-- 建议先标注 300 到 1000 张关键帧
+这样更符合产品定义：
+- `contact_frame`：最后贴手帧
+- `separation_frame`：球手分离帧
+- `final_release_frame`：最终离手帧
 
-## 3. Hugging Face Hosted Inference 通用检测模型
+## 真实验证结果
 
-更适合作为兜底或对照。
+对 `shooting.mp4` 的最新真实跑数结果：
 
-- 示例：`facebook/detr-resnet-50`
-- 说明：能识别 `sports ball`，但并不是专门针对篮球视频优化
+- 原始姿态离手帧：`175`
+- 最后贴手帧：`149`
+- 最终离手帧：`150`
+- 来源：`ball-contact-transition`
+
+说明：
+- 旧逻辑把球已经飞出去很远的帧误当成离手帧
+- 新逻辑已经能把最终离手帧拉回到更接近“刚离手”的位置
+
+参考产物：
+- [analysis_result.json](D:/develop/basketball-master/artifacts/single_ball_assisted_v4/analysis_result.json)
+- [single_overlay.mp4](D:/develop/basketball-master/artifacts/single_ball_assisted_v4/single_overlay.mp4)
+- [149 帧截图](D:/develop/basketball-master/artifacts/single_ball_assisted_v4/overlay_frame_149.jpg)
+- [150 帧截图](D:/develop/basketball-master/artifacts/single_ball_assisted_v4/overlay_frame_150.jpg)
 
 ## 当前工程如何接入
 
@@ -49,22 +72,36 @@
 - `huggingface` / `hf`
 
 接入位置：
-
 - [providers.py](D:/develop/basketball-master/src/basketball_analyzer/detection/providers.py:1)
 - [service.py](D:/develop/basketball-master/src/basketball_analyzer/detection/service.py:1)
+- [service.py](D:/develop/basketball-master/src/basketball_analyzer/service.py:1)
 
 分析时机：
-
 - 先跑姿态分析
-- 再在离手帧附近抽样少量视频帧
+- 再在离手帧附近抽样视频帧
+- 必要时扩大回溯窗口
 - 调用远端检测服务
 - 输出 `ball_detection_result.json`
+- 产出 `release_analysis`
 
-这样做的好处是：
+## 当前输出字段
 
-- 降低远端推理成本
-- 先验证“离手附近能否看到球”
-- 不影响现有姿态分析主流程
+`ball_detection_result.json` 主要用于比较模型：
+- `matched_frame_count`
+- `detection_rate`
+- `release_frame_detected`
+- `nearest_detection_frame`
+- `nearest_detection_delta`
+- `best_frame`
+- `best_confidence`
+
+`release_analysis` 主要用于最终业务结果：
+- `pose_release_frame`
+- `contact_frame`
+- `separation_frame`
+- `final_release_frame`
+- `source`
+- `ball_candidate_wrist_distance`
 
 ## 环境变量
 
@@ -82,15 +119,18 @@
 
 ```bash
 set ROBOFLOW_API_KEY=your_api_key
-basketball-analyzer single --input shooting.mp4 --output artifacts/single_rf --ball-provider roboflow --roboflow-model-id your-workspace/your-model/1
+basketball-analyzer single --input shooting.mp4 --output artifacts/single_rf --ball-provider roboflow --roboflow-model-id basketball-game-detections/9
 ```
 
-## 验证建议
+批量评估：
 
-第一轮只看 3 件事：
+```bash
+set ROBOFLOW_API_KEY=your_api_key
+basketball-analyzer ball-eval --provider roboflow --videos shooting.mp4 curry.mp4 --models basketball-game-detections/9 basketball-detection-dn6fg/1 --output artifacts/ball_eval
+```
 
-1. 离手前后 6 帧内有没有稳定检测到球
-2. 置信度最高的球框是不是落在投篮手附近
-3. 不同模型之间，哪一个在你的真实拍摄视频上漏检最少
+## 下一步建议
 
-如果这 3 件事能成立，就值得把球检测正式并入离手判定逻辑。
+1. 用更多你自己拍的视频验证 `contact_frame -> separation_frame` 规则。
+2. 继续调“贴手阈值”和“飞行阈值”，提升跨场景稳定性。
+3. 后面如果现成 Hosted 模型不够，再转向自建数据集微调检测模型。

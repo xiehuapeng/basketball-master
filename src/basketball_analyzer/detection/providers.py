@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from abc import ABC, abstractmethod
+from typing import Any
 
 from basketball_analyzer.config import BallDetectionConfig
 from basketball_analyzer.models import BallDetection
@@ -13,7 +14,7 @@ class BallDetectionProvider(ABC):
         self.target_labels = {label.lower() for label in config.target_labels}
 
     @abstractmethod
-    def detect(self, image_bytes: bytes) -> list[BallDetection]:
+    def detect(self, image: Any) -> list[BallDetection]:
         raise NotImplementedError
 
     def _filter_detections(self, detections: list[BallDetection]) -> list[BallDetection]:
@@ -40,10 +41,10 @@ class RoboflowBallDetector(BallDetectionProvider):
             raise RuntimeError("Roboflow provider requires ROBOFLOW_API_KEY and ROBOFLOW_MODEL_ID.")
 
         self.model_id = model_id
-        self.client = InferenceHTTPClient(api_url="https://detect.roboflow.com", api_key=api_key)
+        self.client = InferenceHTTPClient(api_url="https://serverless.roboflow.com", api_key=api_key)
 
-    def detect(self, image_bytes: bytes) -> list[BallDetection]:
-        result = self.client.infer(image_bytes, model_id=self.model_id)
+    def detect(self, image: Any) -> list[BallDetection]:
+        result = self.client.infer(image, model_id=self.model_id)
         predictions = result.get("predictions", [])
         detections = [
             BallDetection(
@@ -78,8 +79,8 @@ class HuggingFaceBallDetector(BallDetectionProvider):
         self.client = InferenceClient(provider="hf-inference", api_key=api_key)
         self.model_id = model_id
 
-    def detect(self, image_bytes: bytes) -> list[BallDetection]:
-        result = self.client.object_detection(image_bytes, model=self.model_id)
+    def detect(self, image: Any) -> list[BallDetection]:
+        result = self.client.object_detection(image, model=self.model_id)
         detections: list[BallDetection] = []
         for item in result:
             box = item.get("box", {}) if isinstance(item, dict) else getattr(item, "box", None)
@@ -118,4 +119,3 @@ def build_ball_detector(config: BallDetectionConfig) -> BallDetectionProvider | 
     if provider in {"hf", "huggingface"}:
         return HuggingFaceBallDetector(config)
     raise ValueError(f"Unsupported ball detection provider: {config.provider}")
-

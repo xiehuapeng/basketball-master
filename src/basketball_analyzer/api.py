@@ -15,8 +15,8 @@ class SingleAnalyzeRequest(BaseModel):
     input_video: str
     output_dir: str
     ball_provider: str = "none"
-    roboflow_model_id: str = ""
-    huggingface_model_id: str = ""
+    roboflow_model_id: str | None = None
+    huggingface_model_id: str | None = None
 
 
 class CompareRequest(BaseModel):
@@ -38,8 +38,10 @@ def health() -> dict[str, str]:
 def analyze_single(request: SingleAnalyzeRequest):
     try:
         service.config.ball_detection.provider = request.ball_provider
-        service.config.ball_detection.roboflow_model_id = request.roboflow_model_id
-        service.config.ball_detection.huggingface_model_id = request.huggingface_model_id
+        if request.roboflow_model_id:
+            service.config.ball_detection.roboflow_model_id = request.roboflow_model_id
+        if request.huggingface_model_id:
+            service.config.ball_detection.huggingface_model_id = request.huggingface_model_id
         result = service.analyze_single_video(Path(request.input_video), Path(request.output_dir))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
