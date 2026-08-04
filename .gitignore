@@ -8,6 +8,12 @@ dist/
 build/
 *.egg-info/
 *.log
+*.pt
+*.url
+
+# Local model weights, caches and third-party evaluation media
+models/
+testdata/
 
 # Local outputs
 artifacts/

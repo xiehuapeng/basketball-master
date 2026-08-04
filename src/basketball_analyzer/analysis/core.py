@@ -28,18 +28,104 @@ def calc_angle(a: list[float], b: list[float], c: list[float]) -> float:
 
 
 def choose_shooting_arm(frames_landmarks: list[FrameLandmarks], smooth_window: int) -> str:
-    left_wrist = 15
-    right_wrist = 16
-    left_y = smooth_1d([frame[left_wrist][1] for frame in frames_landmarks], smooth_window)
-    right_y = smooth_1d([frame[right_wrist][1] for frame in frames_landmarks], smooth_window)
+    """Pick the shooting arm using multiple signals so short occlusions do not flip the result.
 
-    left_velocity = np.abs(np.diff(left_y, prepend=left_y[0])).max()
-    right_velocity = np.abs(np.diff(right_y, prepend=right_y[0])).max()
-    return "left" if left_velocity > right_velocity else "right"
+    Signals per arm (visibility-weighted):
+    - peak upward wrist velocity (original heuristic)
+    - how high the wrist rises above the same-side shoulder
+    - mean wrist visibility (an occluded arm should not win on noisy jitter)
+    """
+    left_wrist, right_wrist = 15, 16
+    left_shoulder, right_shoulder = 11, 12
+
+    def arm_score(wrist: int, shoulder: int) -> float:
+        visibilities = np.array([frame[wrist][3] for frame in frames_landmarks], dtype=float)
+        mean_vis = float(np.mean(visibilities)) if len(visibilities) else 0.0
+
+        # Only trust frames where the wrist is reasonably visible.
+        ys = np.array(
+            [frame[wrist][1] if frame[wrist][3] >= 0.3 else np.nan for frame in frames_landmarks],
+            dtype=float,
+        )
+        shoulder_ys = np.array([frame[shoulder][1] for frame in frames_landmarks], dtype=float)
+        valid = ~np.isnan(ys)
+        if valid.sum() < 3:
+            return 0.0
+
+        smoothed = smooth_1d(np.where(valid, ys, np.nanmean(ys)), smooth_window)
+        velocity = float(np.abs(np.diff(smoothed, prepend=smoothed[0])).max())
+
+        # Positive when the wrist rises above the shoulder (image y grows downward).
+        raise_above_shoulder = float(np.nanmax(shoulder_ys[valid] - ys[valid]))
+        raise_above_shoulder = max(0.0, raise_above_shoulder)
+
+        return (velocity + 1.5 * raise_above_shoulder) * (0.5 + 0.5 * mean_vis)
+
+    left_score = arm_score(left_wrist, left_shoulder)
+    right_score = arm_score(right_wrist, right_shoulder)
+    return "left" if left_score > right_score else "right"
 
 
 def _arm_joint_ids(arm: str) -> tuple[int, int, int]:
     return (12, 14, 16) if arm == "right" else (11, 13, 15)
+
+
+def lock_primary_person(
+    frames_landmarks: list[FrameLandmarks],
+    frame_ids: list[int],
+    max_center_jump: float = 0.18,
+    max_scale_ratio: float = 1.8,
+) -> tuple[list[FrameLandmarks], list[int]]:
+    """Keep only frames that stay temporally consistent with the primary subject.
+
+    MediaPipe Pose is single-person; in multi-person scenes the detection can jump
+    between people across frames. We track the hip-center and body scale of a
+    running reference and drop frames whose center jumps too far or whose scale
+    changes too abruptly to belong to the same person.
+    """
+    left_hip, right_hip = 23, 24
+    left_shoulder, right_shoulder = 11, 12
+
+    def center_and_scale(frame: FrameLandmarks) -> tuple[float, float, float]:
+        cx = (frame[left_hip][0] + frame[right_hip][0]) / 2
+        cy = (frame[left_hip][1] + frame[right_hip][1]) / 2
+        shoulder_w = abs(frame[right_shoulder][0] - frame[left_shoulder][0])
+        hip_w = abs(frame[right_hip][0] - frame[left_hip][0])
+        scale = max(1e-6, (shoulder_w + hip_w) / 2)
+        return cx, cy, scale
+
+    kept_frames: list[FrameLandmarks] = []
+    kept_ids: list[int] = []
+    ref_cx = ref_cy = ref_scale = None
+
+    for frame, frame_id in zip(frames_landmarks, frame_ids):
+        cx, cy, scale = center_and_scale(frame)
+        if ref_cx is None:
+            ref_cx, ref_cy, ref_scale = cx, cy, scale
+            kept_frames.append(frame)
+            kept_ids.append(frame_id)
+            continue
+
+        jump = ((cx - ref_cx) ** 2 + (cy - ref_cy) ** 2) ** 0.5
+        scale_ratio = max(scale / ref_scale, ref_scale / scale)
+        if jump > max_center_jump or scale_ratio > max_scale_ratio:
+            # Looks like the detector switched to another person; skip this frame
+            # but keep the reference slowly drifting so we can recover.
+            ref_cx = ref_cx * 0.98 + cx * 0.02
+            ref_cy = ref_cy * 0.98 + cy * 0.02
+            continue
+
+        # Exponential update keeps the reference tracking normal shooter motion.
+        ref_cx = ref_cx * 0.7 + cx * 0.3
+        ref_cy = ref_cy * 0.7 + cy * 0.3
+        ref_scale = ref_scale * 0.7 + scale * 0.3
+        kept_frames.append(frame)
+        kept_ids.append(frame_id)
+
+    # If the filter dropped too much, the "reference" was probably wrong; fall back.
+    if len(kept_frames) < max(10, len(frames_landmarks) // 3):
+        return frames_landmarks, frame_ids
+    return kept_frames, kept_ids
 
 
 def filter_frames(
@@ -50,19 +136,36 @@ def filter_frames(
     min_vis: float,
 ) -> tuple[list[FrameLandmarks], list[int]]:
     shoulder, elbow, wrist = _arm_joint_ids(arm)
-    kept_frames: list[FrameLandmarks] = []
-    kept_ids: list[int] = []
 
-    for frame, frame_id in zip(frames_landmarks, frame_ids):
-        xs = [point[0] for point in frame]
-        ys = [point[1] for point in frame]
-        box_area = (max(xs) - min(xs)) * (max(ys) - min(ys))
-        visibilities = [frame[shoulder][3], frame[elbow][3], frame[wrist][3]]
-        if box_area >= min_box_area and min(visibilities) >= min_vis:
-            kept_frames.append(frame)
-            kept_ids.append(frame_id)
+    def run_filter(area_threshold: float) -> tuple[list[FrameLandmarks], list[int]]:
+        kept_frames: list[FrameLandmarks] = []
+        kept_ids: list[int] = []
+        for frame, frame_id in zip(frames_landmarks, frame_ids):
+            xs = [point[0] for point in frame]
+            ys = [point[1] for point in frame]
+            box_area = (max(xs) - min(xs)) * (max(ys) - min(ys))
+            visibilities = [frame[shoulder][3], frame[elbow][3], frame[wrist][3]]
+            if box_area >= area_threshold and min(visibilities) >= min_vis:
+                kept_frames.append(frame)
+                kept_ids.append(frame_id)
+        return kept_frames, kept_ids
 
-    return kept_frames, kept_ids
+    kept_frames, kept_ids = run_filter(min_box_area)
+    if len(kept_frames) >= max(10, len(frames_landmarks) // 5):
+        return kept_frames, kept_ids
+
+    # Distant-camera fallback: the subject can be much smaller than the
+    # default box-area gate, so relax it to the video's own body size.
+    areas = sorted(
+        (max(p[0] for p in frame) - min(p[0] for p in frame))
+        * (max(p[1] for p in frame) - min(p[1] for p in frame))
+        for frame in frames_landmarks
+    )
+    if not areas:
+        return kept_frames, kept_ids
+    median_area = areas[len(areas) // 2]
+    adaptive_threshold = min(min_box_area, 0.5 * median_area)
+    return run_filter(adaptive_threshold)
 
 
 def auto_clip_shot_segment(

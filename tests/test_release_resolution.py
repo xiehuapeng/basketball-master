@@ -94,7 +94,30 @@ class ReleaseResolutionTests(unittest.TestCase):
 
         self.assertEqual(result.final_release_frame, 175)
         self.assertEqual(result.source, "pose+ball")
-        self.assertEqual(result.contact_frame, 175)
+        # contact_frame now tracks the LAST hand-on-ball frame of the run.
+        self.assertEqual(result.contact_frame, 177)
+        self.assertFalse(result.hand_separation_detected)
+        self.assertIsNone(result.separation_frame)
+
+    def test_pushes_release_forward_when_ball_still_on_hand_at_pose_frame(self):
+        # Ball keeps touching the hand through the pose frame (175..177) and
+        # only shows flight afterwards: release must move to the next valid
+        # frame after the last touch instead of confirming the pose frame.
+        run = make_run([(153, 52.0), (154, 52.0), (155, 53.0), (156, 54.0), (157, 55.0), (175, 56.0), (176, 57.0), (177, 58.0), (178, 120.0)])
+        result = self.service._resolve_release_frame_with_ball(
+            pose_release_frame=155,
+            arm="right",
+            valid_frame_ids=self.valid_ids,
+            segment_start_frame=148,
+            frame_width=100,
+            frame_height=100,
+            frame_to_landmarks=self.frame_to_landmarks,
+            ball_detection=run,
+        )
+
+        self.assertEqual(result.source, "ball-contact-transition")
+        self.assertEqual(result.contact_frame, 157)
+        self.assertEqual(result.final_release_frame, 158)
 
     def test_corrects_release_to_frame_after_last_contact(self):
         run = make_run([(148, 52.0), (149, 53.0), (156, 120.0), (157, 130.0)])

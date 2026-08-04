@@ -10,6 +10,7 @@ from basketball_analyzer.analysis import (
     compute_metrics,
     filter_frames,
     generate_coach_tips_cn,
+    lock_primary_person,
 )
 from basketball_analyzer.config import AnalyzerConfig
 from basketball_analyzer.detection import detect_ball_around_release
@@ -30,9 +31,13 @@ from basketball_analyzer.rendering import overlay_pose_video, render_comparison_
 class AnalysisService:
     # Empirical thresholds for MVP phase. We prefer "ball just left hand"
     # over the older "pose frame can still see the ball anywhere nearby" rule.
+    # Distances are normalized by shoulder width; when ball size is available we
+    # additionally accept contact within ~1.6 ball radii (adaptive to video scale).
     CONTACT_DISTANCE_THRESHOLD = 1.5
     FAR_DISTANCE_THRESHOLD = 3.0
-    EXPANDED_BALL_SEARCH_BEFORE = 30
+    CONTACT_BALL_RADII = 1.6
+    FAR_BALL_RADII = 3.5
+    EXPANDED_BALL_SEARCH_BEFORE = 30  # frames at 30fps; scaled by actual fps
 
     def __init__(self, config: AnalyzerConfig | None = None):
         self.config = config or AnalyzerConfig()
@@ -75,6 +80,7 @@ class AnalysisService:
             )
 
             if self._should_expand_ball_search(release_analysis, seg_ids):
+                fps_scale = max(1.0, pose.metadata.fps / 30.0)
                 expanded_detection = detect_ball_around_release(
                     input_path,
                     filtered_ids,
@@ -82,7 +88,7 @@ class AnalysisService:
                     self.config,
                     window_before=max(
                         self.config.ball_detection.release_window_before,
-                        self.EXPANDED_BALL_SEARCH_BEFORE,
+                        int(round(self.EXPANDED_BALL_SEARCH_BEFORE * fps_scale)),
                     ),
                     window_after=self.config.ball_detection.release_window_after,
                 )
@@ -154,8 +160,10 @@ class AnalysisService:
         provider: str,
         model_ids: list[str],
     ) -> BallDetectionEvaluationReport:
-        if provider.lower() not in {"roboflow", "huggingface", "hf"}:
-            raise ValueError("ball evaluation currently supports provider=roboflow or provider=huggingface/hf")
+        if provider.lower() not in {"local", "roboflow", "huggingface", "hf"}:
+            raise ValueError("ball evaluation supports provider=local, roboflow or huggingface/hf")
+        if provider.lower() == "local" and not model_ids:
+            model_ids = [self.config.ball_detection.local_model_path]
         if not model_ids:
             raise ValueError("At least one model_id is required for ball evaluation.")
 
@@ -171,12 +179,15 @@ class AnalysisService:
         original_provider = self.config.ball_detection.provider
         original_rf_model = self.config.ball_detection.roboflow_model_id
         original_hf_model = self.config.ball_detection.huggingface_model_id
+        original_local_model = self.config.ball_detection.local_model_path
 
         try:
             self.config.ball_detection.provider = provider
             for model_id in model_ids:
                 if provider.lower() == "roboflow":
                     self.config.ball_detection.roboflow_model_id = model_id
+                elif provider.lower() == "local":
+                    self.config.ball_detection.local_model_path = model_id
                 else:
                     self.config.ball_detection.huggingface_model_id = model_id
 
@@ -242,6 +253,7 @@ class AnalysisService:
             self.config.ball_detection.provider = original_provider
             self.config.ball_detection.roboflow_model_id = original_rf_model
             self.config.ball_detection.huggingface_model_id = original_hf_model
+            self.config.ball_detection.local_model_path = original_local_model
 
         report = BallDetectionEvaluationReport(
             provider=provider,
@@ -304,9 +316,10 @@ class AnalysisService:
             raise RuntimeError(f"姿态帧过少，无法分析视频：{video_path}")
 
         arm = choose_shooting_arm(pose.detected_landmarks, self.config.pose.smooth_window)
+        stable_landmarks, stable_ids = lock_primary_person(pose.detected_landmarks, pose.detected_ids)
         filtered_frames, filtered_ids = filter_frames(
-            pose.detected_landmarks,
-            pose.detected_ids,
+            stable_landmarks,
+            stable_ids,
             arm,
             self.config.pose.min_box_area,
             self.config.pose.min_visibility,
@@ -362,7 +375,10 @@ class AnalysisService:
         wrist_index = 16 if arm == "right" else 15
         left_shoulder = 11
         right_shoulder = 12
-        candidates: list[tuple[int, float]] = []
+        static_keys, flight_keys = self._classify_ball_tracks(ball_detection.matched_frames)
+        # candidates: (frame_index, distance_in_shoulder_widths, distance_in_ball_radii | None)
+        candidates: list[tuple[int, float, float | None]] = []
+        flight_far_frames: set[int] = set()
         for frame_run in ball_detection.matched_frames:
             landmarks = frame_to_landmarks.get(frame_run.frame_index)
             if not landmarks:
@@ -374,15 +390,27 @@ class AnalysisService:
             shoulder_width = abs(landmarks[right_shoulder][0] - landmarks[left_shoulder][0]) * frame_width + 1e-6
 
             frame_best_distance = None
+            frame_best_radii = None
             for detection in frame_run.detections:
+                key = (frame_run.frame_index, detection.x, detection.y)
                 dx = detection.x - wrist_x
                 dy = detection.y - wrist_y
-                distance = ((dx * dx + dy * dy) ** 0.5) / shoulder_width
+                distance_px = (dx * dx + dy * dy) ** 0.5
+                distance = distance_px / shoulder_width
+                ball_radius = max(detection.width, detection.height) / 2.0
+                radii = distance_px / ball_radius if ball_radius > 1e-6 else None
+                if key in static_keys and self._is_far(distance, radii):
+                    # A ball resting on the floor / shelf; never a release witness.
+                    continue
+                if key in flight_keys and self._is_far(distance, radii):
+                    # A rising ball far from the hand: the shot is already in flight.
+                    flight_far_frames.add(frame_run.frame_index)
                 if frame_best_distance is None or distance < frame_best_distance:
                     frame_best_distance = distance
+                    frame_best_radii = radii
 
             if frame_best_distance is not None:
-                candidates.append((frame_run.frame_index, float(frame_best_distance)))
+                candidates.append((frame_run.frame_index, float(frame_best_distance), frame_best_radii))
 
         if not candidates:
             return ReleaseAnalysis(
@@ -397,25 +425,40 @@ class AnalysisService:
         candidates.sort(key=lambda item: item[0])
         valid_frame_set = set(valid_frame_ids)
         exact_pose_match = next((item for item in candidates if item[0] == pose_release_frame), None)
-        nearest_candidate_frame, nearest_candidate_distance = min(
+        nearest_candidate_frame, nearest_candidate_distance, nearest_candidate_radii = min(
             candidates,
             key=lambda item: (abs(item[0] - pose_release_frame), item[1]),
         )
+        # "Ball clearly in flight" witnesses need at least two moving-track frames.
+        sorted_flight_frames = sorted(flight_far_frames)
+        earliest_flight = sorted_flight_frames[0] if len(sorted_flight_frames) >= 2 else None
 
-        contact_frames = [frame_index for frame_index, distance in candidates if distance <= self.CONTACT_DISTANCE_THRESHOLD]
+        contact_frames = [item[0] for item in candidates if self._is_contact(item[1], item[2])]
         contact_frame = None
         if contact_frames:
             contact_before_pose = [frame_index for frame_index in contact_frames if frame_index <= pose_release_frame]
             contact_frame = contact_before_pose[-1] if contact_before_pose else contact_frames[-1]
+            # If the ball is still on the hand at (or after) the pose frame, walk
+            # forward through the contiguous contact run: the true release is one
+            # frame after the LAST touch, not the first frame the pose looks right.
+            for frame_index in contact_frames:
+                if frame_index > contact_frame and frame_index - contact_frame <= 3:
+                    contact_frame = frame_index
 
         separation_frame = None
         separation_trend = None
         hand_separation_detected = False
         if contact_frame is not None:
             later_far_frames = [
-                frame_index
-                for frame_index, distance in candidates
-                if frame_index > contact_frame and distance >= self.FAR_DISTANCE_THRESHOLD
+                item[0]
+                for item in candidates
+                if item[0] > contact_frame
+                and (
+                    self._is_far(item[1], item[2])
+                    # Side-on subjects have tiny shoulder-width projections, so
+                    # ball-radius distance alone is enough to witness departure.
+                    or (item[2] is not None and item[2] >= self.FAR_BALL_RADII)
+                )
             ]
             next_valid_frame = next((frame_index for frame_index in valid_frame_ids if frame_index > contact_frame), None)
             if later_far_frames and next_valid_frame is not None:
@@ -426,10 +469,10 @@ class AnalysisService:
         suspicious_pose = bool(
             segment_start_frame is not None
             and pose_release_frame <= segment_start_frame + 1
-        ) or bool(exact_pose_match is not None and exact_pose_match[1] >= self.FAR_DISTANCE_THRESHOLD)
+        ) or bool(exact_pose_match is not None and self._is_far(exact_pose_match[1], exact_pose_match[2]))
 
         if contact_frame is not None and separation_frame is not None:
-            if suspicious_pose or contact_frame < pose_release_frame:
+            if suspicious_pose or contact_frame != pose_release_frame:
                 return ReleaseAnalysis(
                     pose_release_frame=pose_release_frame,
                     final_release_frame=separation_frame,
@@ -442,11 +485,11 @@ class AnalysisService:
                     separation_trend=separation_trend,
                     ball_candidate_frame=separation_frame,
                     ball_candidate_wrist_distance=next(
-                        distance for frame_index, distance in candidates if frame_index == contact_frame
+                        item[1] for item in candidates if item[0] == contact_frame
                     ),
                 )
 
-        if exact_pose_match is not None and exact_pose_match[1] < self.FAR_DISTANCE_THRESHOLD:
+        if exact_pose_match is not None and not self._is_far(exact_pose_match[1], exact_pose_match[2]):
             return ReleaseAnalysis(
                 pose_release_frame=pose_release_frame,
                 final_release_frame=pose_release_frame,
@@ -455,7 +498,7 @@ class AnalysisService:
                 rationale="姿态离手帧附近检测到篮球，且球手距离仍在合理范围内，保留姿态离手帧",
                 hand_separation_detected=hand_separation_detected,
                 contact_frame=contact_frame,
-                separation_frame=separation_frame or pose_release_frame,
+                separation_frame=separation_frame,
                 separation_trend=separation_trend,
                 ball_candidate_frame=pose_release_frame,
                 ball_candidate_wrist_distance=exact_pose_match[1],
@@ -474,6 +517,38 @@ class AnalysisService:
                 separation_trend=separation_trend,
             )
 
+        if earliest_flight is not None and pose_release_frame > earliest_flight:
+            bounded = max((f for f in valid_frame_ids if f <= earliest_flight), default=None)
+            if bounded is not None and bounded < pose_release_frame:
+                return ReleaseAnalysis(
+                    pose_release_frame=pose_release_frame,
+                    final_release_frame=bounded,
+                    source="ball-flight-bound",
+                    delta_from_pose=bounded - pose_release_frame,
+                    rationale="篮球在更早的帧已在空中飞行，将离手帧回溯到飞行首帧",
+                    hand_separation_detected=True,
+                    contact_frame=contact_frame,
+                    separation_frame=bounded,
+                    separation_trend="flight-before-pose-release",
+                    ball_candidate_frame=earliest_flight,
+                    ball_candidate_wrist_distance=next(
+                        (item[1] for item in candidates if item[0] == earliest_flight), None
+                    ),
+                )
+
+        if self._is_far(nearest_candidate_distance, nearest_candidate_radii):
+            return ReleaseAnalysis(
+                pose_release_frame=pose_release_frame,
+                final_release_frame=pose_release_frame,
+                source="pose",
+                delta_from_pose=0,
+                rationale="所有篮球候选帧都远离投篮手（疑似背景球或已飞远），保留姿态离手帧",
+                hand_separation_detected=hand_separation_detected,
+                contact_frame=contact_frame,
+                separation_frame=separation_frame,
+                separation_trend=separation_trend,
+            )
+
         return ReleaseAnalysis(
             pose_release_frame=pose_release_frame,
             final_release_frame=nearest_candidate_frame,
@@ -482,11 +557,82 @@ class AnalysisService:
             rationale="使用距离姿态离手帧最近的篮球候选帧修正最终离手帧",
             hand_separation_detected=hand_separation_detected,
             contact_frame=contact_frame,
-            separation_frame=separation_frame or nearest_candidate_frame,
+            separation_frame=separation_frame,
             separation_trend=separation_trend,
             ball_candidate_frame=nearest_candidate_frame,
             ball_candidate_wrist_distance=nearest_candidate_distance,
         )
+
+    def _is_contact(self, shoulder_distance: float, ball_radii: float | None) -> bool:
+        if shoulder_distance <= self.CONTACT_DISTANCE_THRESHOLD:
+            return True
+        return ball_radii is not None and ball_radii <= self.CONTACT_BALL_RADII
+
+    def _is_far(self, shoulder_distance: float, ball_radii: float | None) -> bool:
+        if shoulder_distance < self.FAR_DISTANCE_THRESHOLD:
+            return False
+        return ball_radii is None or ball_radii >= self.FAR_BALL_RADII
+
+    @staticmethod
+    def _classify_ball_tracks(matched_frames) -> tuple[set, set]:
+        """Split ball detections into static-background tracks and moving (flight) tracks.
+
+        Links detections across frames with a nearest-neighbor gate, then classifies
+        each track by how far it travels relative to the ball size. Returns two sets
+        of keys `(frame_index, x, y)`.
+        """
+        detections: list[tuple[int, float, float, float]] = []
+        for run in matched_frames:
+            for det in run.detections:
+                detections.append((run.frame_index, det.x, det.y, max(det.width, det.height)))
+
+        tracks: list[list[tuple[int, float, float, float]]] = []
+        for det in sorted(detections, key=lambda d: d[0]):
+            frame, x, y, size = det
+            best_track = None
+            best_dist = None
+            for track in tracks:
+                last_frame, last_x, last_y, last_size = track[-1]
+                if last_frame >= frame:
+                    continue
+                gap = frame - last_frame
+                if gap > 6:
+                    # Long gaps let unrelated balls chain into one polluted track.
+                    continue
+                size_ratio = max(size, last_size) / max(min(size, last_size), 1e-6)
+                if size_ratio > 1.6:
+                    continue
+                dist = ((x - last_x) ** 2 + (y - last_y) ** 2) ** 0.5
+                if dist <= max(12.0, 1.5 * max(size, last_size)) * min(gap, 3) and (
+                    best_dist is None or dist < best_dist
+                ):
+                    best_track = track
+                    best_dist = dist
+            if best_track is not None:
+                best_track.append(det)
+            else:
+                tracks.append([det])
+
+        static_keys: set = set()
+        flight_keys: set = set()
+        for track in tracks:
+            if len(track) < 3:
+                continue
+            xs = [t[1] for t in track]
+            ys = [t[2] for t in track]
+            mean_size = sum(t[3] for t in track) / len(track)
+            span = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
+            net_rise = track[0][2] - track[-1][2]  # image y grows downward
+            rising_steps = sum(1 for prev, cur in zip(track, track[1:]) if cur[2] <= prev[2] + 1.0)
+            mostly_rising = rising_steps >= 0.8 * (len(track) - 1)
+            keys = {(t[0], t[1], t[2]) for t in track}
+            if span <= 0.6 * mean_size:
+                static_keys |= keys
+            elif net_rise >= 0.8 * mean_size and net_rise >= 0.6 * span and mostly_rising:
+                # Camera pans move ground balls sideways; a shot in flight keeps
+                # rising, with most of its travel going upward.
+                flight_keys |= keys
+        return static_keys, flight_keys
 
     def _compute_metrics_for_frame(self, context: dict, arm: str, release_frame: int):
         if release_frame in context["seg_ids"]:
@@ -509,12 +655,18 @@ class AnalysisService:
             release_analysis.ball_candidate_wrist_distance >= self.FAR_DISTANCE_THRESHOLD
         ):
             return True
+        # No contact evidence yet: look further back for the last hand-on-ball frame.
+        if release_analysis.contact_frame is None and release_analysis.source not in {"pose+ball"}:
+            return True
         return False
 
     @staticmethod
     def _is_better_release_analysis(current: ReleaseAnalysis, candidate: ReleaseAnalysis) -> bool:
-        if candidate.source == "ball-contact-transition" and current.source != "ball-contact-transition":
-            return True
+        ranks = {"ball-contact-transition": 3, "ball-flight-bound": 2}
+        current_rank = ranks.get(current.source, 1)
+        candidate_rank = ranks.get(candidate.source, 1)
+        if candidate_rank != current_rank:
+            return candidate_rank > current_rank
         if candidate.contact_frame is not None and current.contact_frame is None:
             return True
         if candidate.final_release_frame < current.final_release_frame:
