@@ -181,6 +181,29 @@ basketball-analyzer ball-eval --provider roboflow --videos shooting.mp4 curry.mp
 
 ## API 用法
 
+### Windows 一键启动与关闭
+
+直接双击项目根目录的：
+
+- `start.bat`：检查环境与依赖，在后台启动服务，通过健康检查后自动打开网页
+- `stop.bat`：只关闭由启动脚本记录的 Basketball Analyzer 服务进程
+
+运行日志和 PID 文件保存在 `artifacts/runtime/`。默认访问地址为
+[http://127.0.0.1:8000](http://127.0.0.1:8000)。
+
+也可以在 PowerShell 中执行：
+
+```powershell
+.\start.bat
+.\stop.bat
+```
+
+如果需要使用其他端口：
+
+```powershell
+.\scripts\start.ps1 -Port 8080
+```
+
 启动服务：
 
 ```bash
