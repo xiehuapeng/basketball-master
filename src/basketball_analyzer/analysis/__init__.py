@@ -15,6 +15,7 @@ from .core import (
     filter_frames,
     find_release_frame_early,
     generate_coach_tips_cn,
+    lock_primary_person,
     smooth_1d,
 )
 
@@ -30,6 +31,7 @@ __all__ = [
     "find_release_frame_early",
     "generate_coach_tips_cn",
     "interp_landmarks",
+    "lock_primary_person",
     "map_reference_to_target",
     "maybe_mirror_landmarks",
     "sample_landmarks_at",

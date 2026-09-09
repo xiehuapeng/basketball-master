@@ -110,10 +110,65 @@ class HuggingFaceBallDetector(BallDetectionProvider):
         return self._filter_detections(detections)
 
 
+class LocalYoloBallDetector(BallDetectionProvider):
+    """Free, offline detector based on Ultralytics YOLO (COCO class `sports ball`).
+
+    No API key required. Uses a lower confidence threshold plus a small-object
+    friendly inference size, because a basketball is usually tiny in shooting videos.
+    """
+
+    def __init__(self, config: BallDetectionConfig):
+        super().__init__(config)
+        try:
+            from ultralytics import YOLO  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "Local ball detection requires `pip install ultralytics`."
+            ) from exc
+
+        from pathlib import Path
+
+        model_path = config.local_model_path or "yolov8n.pt"
+        # A missing custom checkpoint should not break analysis; the stock COCO
+        # model still knows "sports ball" and downloads automatically.
+        if "/" in model_path.replace("\\", "/") and not Path(model_path).exists():
+            model_path = "yolov8n.pt"
+        self.model = YOLO(model_path)
+        self.imgsz = int(config.local_imgsz or 1280)
+        self.confidence = float(config.local_confidence_threshold or 0.12)
+
+    def detect(self, image: Any) -> list[BallDetection]:
+        results = self.model.predict(image, imgsz=self.imgsz, conf=self.confidence, verbose=False)
+        detections: list[BallDetection] = []
+        for result in results:
+            names = result.names
+            if result.boxes is None:
+                continue
+            for box in result.boxes:
+                label = str(names.get(int(box.cls[0]), ""))
+                xyxy = box.xyxy[0].tolist()
+                xmin, ymin, xmax, ymax = (float(v) for v in xyxy)
+                detections.append(
+                    BallDetection(
+                        label=label,
+                        confidence=float(box.conf[0]),
+                        x=(xmin + xmax) / 2,
+                        y=(ymin + ymax) / 2,
+                        width=max(0.0, xmax - xmin),
+                        height=max(0.0, ymax - ymin),
+                        source="local-yolo",
+                    )
+                )
+        # Local YOLO uses its own confidence gate; only apply the label filter here.
+        return [d for d in detections if d.label.lower() in self.target_labels and d.confidence >= self.confidence]
+
+
 def build_ball_detector(config: BallDetectionConfig) -> BallDetectionProvider | None:
     provider = (config.provider or "none").strip().lower()
     if provider in {"", "none"}:
         return None
+    if provider in {"local", "yolo", "local-yolo"}:
+        return LocalYoloBallDetector(config)
     if provider == "roboflow":
         return RoboflowBallDetector(config)
     if provider in {"hf", "huggingface"}:

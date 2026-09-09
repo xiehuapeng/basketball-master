@@ -57,6 +57,12 @@ class BallDetectionConfig:
     roboflow_api_key: str = ""
     huggingface_model_id: str = ""
     huggingface_api_key: str = ""
+    # Local free model (Ultralytics YOLO). Default is a basketball fine-tuned
+    # YOLO11 checkpoint (HF: Lumos-88/YOLO11-fine-tuned-for-basketball-detection);
+    # falls back to stock yolov8n.pt if the file is missing. No API key needed.
+    local_model_path: str = "models/basketball_yolo11.pt"
+    local_imgsz: int = 1280
+    local_confidence_threshold: float = 0.12
 
 
 @dataclass(slots=True)

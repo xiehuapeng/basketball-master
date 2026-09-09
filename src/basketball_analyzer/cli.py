@@ -21,10 +21,20 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--reference", required=True, help="Path to the reference video")
     compare.add_argument("--output", required=True, help="Directory for outputs")
 
-    ball_eval = subparsers.add_parser("ball-eval", help="Batch evaluate remote basketball detection models")
-    ball_eval.add_argument("--provider", choices=["roboflow", "huggingface", "hf"], required=True, help="Remote provider")
+    ball_eval = subparsers.add_parser("ball-eval", help="Batch evaluate basketball detection models")
+    ball_eval.add_argument(
+        "--provider",
+        choices=["local", "roboflow", "huggingface", "hf"],
+        required=True,
+        help="Detection provider (local = free offline YOLO)",
+    )
     ball_eval.add_argument("--videos", nargs="+", required=True, help="One or more local video paths")
-    ball_eval.add_argument("--models", nargs="+", required=True, help="One or more remote model ids")
+    ball_eval.add_argument(
+        "--models",
+        nargs="+",
+        default=None,
+        help="Model ids (remote) or model paths (local). Optional for provider=local",
+    )
     ball_eval.add_argument("--output", required=True, help="Directory for evaluation outputs")
 
     return parser
@@ -33,12 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
 def _add_ball_detection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ball-provider",
-        choices=["none", "roboflow", "huggingface", "hf"],
+        choices=["none", "local", "roboflow", "huggingface", "hf"],
         default="none",
-        help="Optional remote basketball detection provider",
+        help="Basketball detection provider (local = free offline YOLO, no API key)",
     )
     parser.add_argument("--roboflow-model-id", default=None, help="Roboflow hosted model ID")
     parser.add_argument("--huggingface-model-id", default=None, help="Hugging Face object detection model ID")
+    parser.add_argument("--local-model-path", default=None, help="Local YOLO model path (default: yolov8n.pt)")
 
 
 def main() -> None:
@@ -52,6 +63,8 @@ def main() -> None:
             service.config.ball_detection.roboflow_model_id = args.roboflow_model_id
         if args.huggingface_model_id:
             service.config.ball_detection.huggingface_model_id = args.huggingface_model_id
+        if args.local_model_path:
+            service.config.ball_detection.local_model_path = args.local_model_path
         result = service.analyze_single_video(args.input, args.output)
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return
@@ -66,7 +79,7 @@ def main() -> None:
             input_videos=args.videos,
             output_dir=args.output,
             provider=args.provider,
-            model_ids=args.models,
+            model_ids=args.models or [],
         )
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
         return

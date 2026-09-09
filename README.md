@@ -12,17 +12,21 @@
 - 跑通真实视频单次分析和球星对比分析
 - 固定 `mediapipe==0.10.14`，解决当前 Windows 环境兼容问题
 - 输出标准化 JSON、关键帧截图、骨架叠加视频
-- 接入远端篮球检测，支持 `Roboflow` 和 `Hugging Face Hosted Inference`
-- 增加篮球检测批量评估入口，支持多视频、多模型对比
-- 已验证当前默认优先模型为 `basketball-game-detections/9`
+- 接入本地免费篮球检测（Ultralytics YOLO，默认篮球微调模型 `models/basketball_yolo11.pt`），远端 `Roboflow` / `Hugging Face` 保留为可选
+- 增加篮球检测批量评估入口，支持多视频、多模型对比（含 local provider）
+- 本地篮球微调模型在 shooting / shoot1 / curry 上检测率均 100%（Roboflow Hosted 在 shoot1 上为 0%）
 - 输出视频已支持篮球检测框可视化
 - `release_analysis` 已支持姿态离手帧、最后贴手帧、最终离手帧、球手分离帧和分离趋势联合输出
 - 已将离手判定从“看到球就确认”升级为“最后贴手帧 -> 下一帧离手”的修正规则
+- 已支持球轨迹分类（静止背景球抑制 / 飞行证据）与 `ball-flight-bound` 回溯
+- 已支持主体人物锁定（时序连续性过滤）与远景小人物自适应过滤
+- 主手判定升级为多信号融合（腕速度 + 举高幅度 + 可见度）
+- FastAPI 已提供内嵌网页上传页与 `/tasks/*` 异步任务队列
 
 当前还没完成：
-- 在更多真实拍摄视频上验证离手修正规则和阈值泛化能力
-- 将当前启发式球手分离规则升级为更稳健的时序策略
-- 多人跟踪、批量任务、前端上传页面、异步任务系统
+- 多次连续投篮长视频的自动切片
+- 篮球微调模型在全身远景场景会把手误检为球（该类视频建议 `--local-model-path yolov8n.pt`）
+- 任务队列持久化、批量任务
 
 ## 当前能力
 
@@ -42,11 +46,14 @@
   - CLI
   - FastAPI 服务
   - 文档与测试骨架
-- 可选远端篮球检测
-  - 支持 Roboflow Hosted API
-  - 支持 Hugging Face Hosted Inference
+- 可插拔篮球检测
+  - 默认本地免费模型（Ultralytics YOLO 篮球微调权重）
+  - 可选 Roboflow Hosted API / Hugging Face Hosted Inference
   - 支持低成本抽帧检测
   - 支持批量评估多个模型并输出汇总 JSON
+- 前端与任务队列
+  - 内嵌网页上传页（`GET /`）
+  - `/tasks/single`、`/tasks/compare` 异步任务提交与状态查询
 
 ## 已验证结果
 
@@ -56,18 +63,17 @@
 - FastAPI `/health`
 - FastAPI `/analyze/single`
 - FastAPI `/analyze/compare`
-- Roboflow 远端篮球检测接入与真实视频联调
+- FastAPI `/tasks/*` 异步任务与网页上传页
+- 本地免费篮球检测在 7 个真实视频上的回归（见 `docs/project-status.md`）
 
-这次最新验证的关键结果：
-- `shooting.mp4` 的姿态离手帧原始结果是 `175`
-- 加入球辅助回溯后，最终离手帧修正为 `150`
-- `149` 被识别为“最后贴手帧”
-- `150` 被识别为“刚离手”的最终帧
+这次最新验证的关键结果（状态基线：2026-08-04，纠正旧结论）：
+- `shooting.mp4` 逐帧人工核验：150 帧球仍在手上，真实离手 ≈ `161` 帧（旧文档“150 为离手帧”有误）
+- 当前算法最终离手帧为 `164`（ball-flight-bound，误差 +3），纯姿态启发式为 `172`（误差 +11）
+- `shoot1.mp4`（旧 Hosted 模型全漏检）现由本地模型 100% 检出，离手帧 `109` 获 pose+ball 双重确认
+- 远景切片 clip3 覆盖“球贴手贯穿 pose 帧”场景，离手帧由 65 正确推进到 `70`
 
-参考产物：
-- [single_ball_assisted_v4](D:/develop/basketball-master/artifacts/single_ball_assisted_v4)
-- [analysis_result.json](D:/develop/basketball-master/artifacts/single_ball_assisted_v4/analysis_result.json)
-- [single_overlay.mp4](D:/develop/basketball-master/artifacts/single_ball_assisted_v4/single_overlay.mp4)
+完整回归表和当前限制见 [项目状态与路线图](docs/project-status.md)。`artifacts/` 为本地运行产物，
+不随仓库提交，避免把旧产物误当成当前算法结论。
 
 ## 工程框架
 
@@ -97,7 +103,7 @@ basketball-master/
 - 视频处理：`OpenCV`
 - 中文叠字：`Pillow`
 - API：`FastAPI`
-- 远端篮球检测：`Roboflow` / `Hugging Face Hosted Inference`
+- 本地篮球检测：`Ultralytics YOLO`（免费）；远端可选 `Roboflow` / `Hugging Face`
 
 说明：
 - 当前真正的模型部分主要还是 `MediaPipe Pose`
@@ -113,6 +119,12 @@ basketball-master/
 py -3.11 -m venv .venv311
 .venv311\Scripts\activate
 pip install .[api]
+```
+
+如果要用本地免费篮球检测（默认 provider），安装：
+
+```bash
+pip install .[api,local]
 ```
 
 如果要接远端篮球检测，再安装：
@@ -135,7 +147,22 @@ basketball-analyzer single --input shooting.mp4 --output artifacts/single
 basketball-analyzer compare --input shooting.mp4 --reference curry.mp4 --output artifacts/compare
 ```
 
-接 Roboflow 远端篮球检测：
+本地免费篮球检测（默认模型路径 `models/basketball_yolo11.pt`，缺失时回退并自动下载 `yolov8n.pt`）：
+
+1. 从 [Lumos-88/YOLO11-fine-tuned-for-basketball-detection](https://huggingface.co/Lumos-88/YOLO11-fine-tuned-for-basketball-detection)
+   下载 `best.pt`。
+2. 在项目根目录创建 `models/`，将权重保存为 `models/basketball_yolo11.pt`。
+
+模型权重、下载缓存和第三方测试视频只保存在本机，不提交到 Git。模型页面标注 MIT，
+但其基础 Ultralytics YOLO 软件另有 AGPL-3.0/企业许可要求，商业发布前需单独完成许可证评估。
+
+```bash
+basketball-analyzer single --input shooting.mp4 --output artifacts/single_local --ball-provider local
+# 全身远景视频可尝试切换 COCO 通用模型
+basketball-analyzer single --input testdata/gh_shot_arc.mp4 --output artifacts/single_arc --ball-provider local --local-model-path yolov8n.pt
+```
+
+接 Roboflow 远端篮球检测（可选）：
 
 ```bash
 set ROBOFLOW_API_KEY=your_api_key
@@ -145,11 +172,37 @@ basketball-analyzer single --input shooting.mp4 --output artifacts/single_rf --b
 批量评估多个篮球检测模型：
 
 ```bash
+# 本地模型评估（无需 API key）
+basketball-analyzer ball-eval --provider local --videos shooting.mp4 shoot1.mp4 curry.mp4 --output artifacts/ball_eval_local
+# 远端模型评估
 set ROBOFLOW_API_KEY=your_api_key
 basketball-analyzer ball-eval --provider roboflow --videos shooting.mp4 curry.mp4 --models model-a/1 model-b/1 --output artifacts/ball_eval
 ```
 
 ## API 用法
+
+### Windows 一键启动与关闭
+
+直接双击项目根目录的：
+
+- `start.bat`：检查环境与依赖，在后台启动服务，通过健康检查后自动打开网页
+- `stop.bat`：只关闭由启动脚本记录的 Basketball Analyzer 服务进程
+
+运行日志和 PID 文件保存在 `artifacts/runtime/`。默认访问地址为
+[http://127.0.0.1:8000](http://127.0.0.1:8000)。
+
+也可以在 PowerShell 中执行：
+
+```powershell
+.\start.bat
+.\stop.bat
+```
+
+如果需要使用其他端口：
+
+```powershell
+.\scripts\start.ps1 -Port 8080
+```
 
 启动服务：
 
@@ -174,16 +227,15 @@ curl -X POST http://127.0.0.1:8000/analyze/single ^
 ## 下一步计划
 
 短期优先级：
-1. 扩充更多真实视频样本，继续验证 `basketball-game-detections/9` 的泛化能力
-2. 继续调“最后贴手帧 -> 离手帧”的阈值，让不同拍摄条件下更稳
-3. 把球手分离从当前启发式规则升级成更稳健的时序策略
+1. 继续扩充真实视频样本（抖音网页版截取、免费素材站），覆盖更多机位/光照
+2. 针对“手部误检为球”增加候选过滤，提升微调模型在远景场景的可靠性
+3. 多次投篮长视频自动切片
 4. 补充批量任务、耗时日志和更多测试
 
 中期计划：
-1. 接入人物跟踪，提升多人或复杂背景下稳定性
+1. 任务队列持久化与报告页
 2. 把双视频对比升级成阶段化对齐与指标差异报告
-3. 增加前端上传页和任务状态接口
-4. 建立训练记录、用户历史与趋势图
+3. 建立训练记录、用户历史与趋势图
 
 长期方向：
 1. 升级到服务端更强姿态模型
